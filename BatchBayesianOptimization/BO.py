@@ -10,6 +10,7 @@ import sobol_seq
 import numpy as np
 import random
 from datetime import datetime
+import matplotlib.pyplot as plt
 
 
 # -----------------------------------------------------
@@ -61,6 +62,7 @@ def encode_cell_type(cell_str):
 # -----------------------------------------------------
 # HELPER 3: convert LAB format -> GP numeric format
 # -----------------------------------------------------
+# convert from lab format (with categorical) to GP numeric format (one-hot encoded)
 def X_lab_to_GP(X_lab):
     X_num = []
     for row in X_lab:
@@ -202,3 +204,45 @@ print("Final number of points:", len(BO_m.Y))
 print("Total time:", sum(BO_m.time))
 print("Best Y:", max(BO_m.Y))
 print("Best X:", BO_m.X_lab[np.argmax(BO_m.Y)])
+
+time_s = np.array(BO_m.time)          # seconds
+titre  = np.array(BO_m.Y)
+iters  = np.arange(1, len(titre)+1)
+
+# ---- Figure 1: time & titre per iteration ----
+fig, axes = plt.subplots(2, 1, figsize=(8, 6), sharex=True)
+
+axes[0].scatter(iters, time_s, s=10)
+axes[0].set_ylabel("Time [s]")
+
+axes[1].plot(iters, titre, linewidth=2)
+axes[1].set_ylabel("Titre Conc. [g/L]")
+axes[1].set_xlabel("Iterations")
+
+plt.tight_layout()
+plt.show()
+
+# ---- Figure 2: cumulative plots ----
+cum_time_s  = np.cumsum(time_s)
+cum_titre   = np.cumsum(titre)
+
+fig, axes = plt.subplots(3, 1, figsize=(8, 8))
+
+axes[0].plot(iters, cum_time_s)
+axes[0].set_ylabel("Cumulative Time [s]")
+
+axes[1].plot(iters, cum_titre)
+axes[1].set_ylabel("Cumulative Titre [g/L]")
+
+axes[2].plot(cum_time_s, cum_titre)
+axes[2].set_ylabel("Cumulative Titre [g/L]")
+axes[2].set_xlabel("Cumulative Time [s]")
+
+plt.tight_layout()
+plt.show()
+
+# ---- score up to 60 seconds ----
+limit_s = 60
+mask  = np.cumsum(time_s) <= limit_s
+score = np.sum(titre[mask])
+print("Accumulated titre up to 60 s:", score)
