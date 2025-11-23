@@ -121,7 +121,6 @@ class GP_model:
         for i in range(ny_dim):    
             # --- multistart loop --- # 
             for j in range(multi_start):
-                print('multi_start hyper parameter optimization iteration = ',j,'  input = ',i)
                 hyp_init    = lb + (ub-lb)*multi_startvec[j,:]
                 # --- hyper-parameter optimization --- #
                 res = minimize(self.negative_loglikelihood,hyp_init,args=(X_norm,Y_norm[:,i])\
