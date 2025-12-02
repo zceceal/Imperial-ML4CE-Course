@@ -266,7 +266,7 @@ class BO:
 # BO EXECUTION BLOCK (REQUIRED)
 # -----------------------------------------------------
 BO_m = BO(
-    max_iters=10,
+    max_iters=15,
     batch_size=5,
     n_init=6,
     n_cand=5000,

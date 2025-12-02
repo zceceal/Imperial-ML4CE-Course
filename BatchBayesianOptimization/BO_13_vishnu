@@ -1,0 +1,395 @@
+# ------------------- GROUP INFO ----------------------
+group_names     = ['Your Name']
+cid_numbers     = ['00000000']
+oral_assessment = [1]
+
+# ------------------- IMPORTS -------------------------
+import MLCE_CWBO2025.virtual_lab as virtual_lab
+import numpy as np
+import scipy
+import random
+import sobol_seq
+from datetime import datetime
+import matplotlib.pyplot as plt  # For live visualization
+
+# Enable interactive mode
+plt.ion()
+
+# =====================================================
+# GP MODEL
+# =====================================================
+class GP_model:
+    def __init__(self, X, Y, kernel_type='RBF', multi_hyper=1, optimise=True):
+        self.X = np.asarray(X, dtype=float)
+        self.Y = np.asarray(Y, dtype=float).reshape(-1, 1)
+        self.n, self.d = self.X.shape
+        self.kernel_type = kernel_type
+        self.multi_hyper = max(1, int(multi_hyper))
+        self.log_lengthscales = np.zeros(self.d)
+        self.log_signal = np.log(1.0)
+        self.log_noise = np.log(1e-3)
+        self.L = None
+        self.alpha = None
+        if optimise:
+            self._optimise_hypers()
+        self._build_cache()
+
+    def _get_hyper_vector(self):
+        return np.concatenate([self.log_lengthscales, np.array([self.log_signal, self.log_noise])])
+
+    def _set_hyper_vector(self, theta):
+        self.log_lengthscales = theta[:self.d]
+        self.log_signal = theta[self.d]
+        self.log_noise = theta[self.d + 1]
+
+    def _rbf_kernel(self, X1, X2, lengthscales, signal_var):
+        X1_scaled = X1 / lengthscales
+        X2_scaled = X2 / lengthscales
+        sqdist = (np.sum(X1_scaled**2, axis=1).reshape(-1, 1) + 
+                  np.sum(X2_scaled**2, axis=1).reshape(1, -1) - 
+                  2.0 * np.dot(X1_scaled, X2_scaled.T))
+        return signal_var * np.exp(-0.5 * sqdist)
+
+    def _kernel_train(self):
+        lengthscales = np.exp(self.log_lengthscales)
+        signal_var = np.exp(self.log_signal) ** 2
+        noise_std = np.exp(self.log_noise)
+        K = self._rbf_kernel(self.X, self.X, lengthscales, signal_var)
+        K += (noise_std**2 + 1e-8) * np.eye(self.n)
+        return K
+
+    def _build_cache(self):
+        K = self._kernel_train()
+        self.L, lower = scipy.linalg.cho_factor(K, lower=True, overwrite_a=True, check_finite=False)
+        self.alpha = scipy.linalg.cho_solve((self.L, lower), self.Y, check_finite=False)
+
+    def _neg_log_marginal_likelihood(self, theta):
+        self._set_hyper_vector(theta)
+        try:
+            K = self._kernel_train()
+            L, lower = scipy.linalg.cho_factor(K, lower=True, overwrite_a=False, check_finite=False)
+        except np.linalg.LinAlgError:
+            return 1e25
+        alpha = scipy.linalg.cho_solve((L, lower), self.Y, check_finite=False)
+        quad_scalar = self.Y.T.dot(alpha).ravel()[0]
+        return 0.5 * quad_scalar + np.sum(np.log(np.diag(L))) + 0.5 * self.n * np.log(2.0 * np.pi)
+
+    def _optimise_hypers(self):
+        best_theta = self._get_hyper_vector()
+        best_nll = self._neg_log_marginal_likelihood(best_theta)
+        bounds = [(np.log(0.05), np.log(5.0)) for _ in range(self.d)]
+        bounds += [(np.log(0.1), np.log(10.0)), (np.log(1e-5), np.log(0.5))]
+        for _ in range(self.multi_hyper):
+            theta0 = self._get_hyper_vector() + np.random.normal(scale=0.5, size=self.d + 2)
+            res = scipy.optimize.minimize(self._neg_log_marginal_likelihood, theta0,
+                                         method='L-BFGS-B', bounds=bounds, options={'maxiter': 50})
+            if res.success and res.fun < best_nll:
+                best_nll = res.fun
+                best_theta = res.x
+        self._set_hyper_vector(best_theta)
+
+    def predict(self, X_star):
+        X_star = np.asarray(X_star, dtype=float)
+        if X_star.ndim == 1:
+            X_star = X_star.reshape(1, -1)
+        lengthscales = np.exp(self.log_lengthscales)
+        signal_var = np.exp(self.log_signal) ** 2
+        K_s = self._rbf_kernel(X_star, self.X, lengthscales, signal_var)
+        mean = K_s.dot(self.alpha)
+        v = scipy.linalg.cho_solve((self.L, True), K_s.T, check_finite=False)
+        var = signal_var - np.sum(K_s.T * v, axis=0)
+        return mean.reshape(-1, 1), np.maximum(var, 1e-12).reshape(-1, 1)
+
+# =====================================================
+# HELPER FUNCTIONS
+# =====================================================
+def encode_cell_type(cell_str):
+    return {'celltype_1': [1.0, 0.0, 0.0], 'celltype_2': [0.0, 1.0, 0.0], 
+            'celltype_3': [0.0, 0.0, 1.0]}[cell_str]
+
+def X_lab_to_GP(X_lab):
+    X_num = []
+    for row in X_lab:
+        T, pH, F1, F2, F3, cell = row
+        T_scaled, pH_scaled = (T-30)/10, (pH-6)/2
+        F1_scaled, F2_scaled, F3_scaled = F1/50, F2/50, F3/50
+        X_num.append([T_scaled, pH_scaled, F1_scaled, F2_scaled, F3_scaled] + encode_cell_type(cell))
+    return np.array(X_num, float)
+
+def objective_func(X_lab):
+    return np.array(virtual_lab.conduct_experiment(X_lab)).reshape(-1, 1)
+
+def generate_initial_design_lab(n_init=6, seed=None):
+    if seed is not None:
+        np.random.seed(seed)
+        random.seed(seed)
+    sobol_points = sobol_seq.i4_sobol_generate(5, n_init)
+    T_vals = 30 + sobol_points[:, 0] * 10
+    pH_vals = 6 + sobol_points[:, 1] * 2
+    F1_vals, F2_vals, F3_vals = sobol_points[:, 2]*50, sobol_points[:, 3]*50, sobol_points[:, 4]*50
+    base_cells = ['celltype_1', 'celltype_2', 'celltype_3']
+    cell_types = (base_cells * (n_init // 3 + 1))[:n_init]
+    random.shuffle(cell_types)
+    return [[float(T_vals[i]), float(pH_vals[i]), float(F1_vals[i]), 
+             float(F2_vals[i]), float(F3_vals[i]), cell_types[i]] for i in range(n_init)]
+
+def generate_candidate_batch_lab(n_base=8000, best_x=None):
+    sobol_points = sobol_seq.i4_sobol_generate(5, n_base)
+    
+    if best_x is not None:
+        n_local = int(n_base * 0.75)
+        T_center, pH_center, F1_c, F2_c, F3_c = best_x[:5]
+        T_local = np.clip(T_center + (sobol_points[:n_local, 0] - 0.5) * 2, 30, 40)
+        pH_local = np.clip(pH_center + (sobol_points[:n_local, 1] - 0.5) * 0.4, 6, 8)
+        F1_local = np.clip(F1_c + (sobol_points[:n_local, 2] - 0.5) * 10, 0, 50)
+        F2_local = np.clip(F2_c + (sobol_points[:n_local, 3] - 0.5) * 10, 0, 50)
+        F3_local = np.clip(F3_c + (sobol_points[:n_local, 4] - 0.5) * 10, 0, 50)
+        
+        T_global = 30 + sobol_points[n_local:, 0] * 10
+        pH_global = 6 + sobol_points[n_local:, 1] * 2
+        F1_global, F2_global, F3_global = sobol_points[n_local:, 2]*50, sobol_points[n_local:, 3]*50, sobol_points[n_local:, 4]*50
+        
+        T = np.concatenate([T_local, T_global])
+        pH = np.concatenate([pH_local, pH_global])
+        F1 = np.concatenate([F1_local, F1_global])
+        F2 = np.concatenate([F2_local, F2_global])
+        F3 = np.concatenate([F3_local, F3_global])
+    else:
+        T, pH = 30 + sobol_points[:, 0]*10, 6 + sobol_points[:, 1]*2
+        F1, F2, F3 = sobol_points[:, 2]*50, sobol_points[:, 3]*50, sobol_points[:, 4]*50
+    
+    X = []
+    for i in range(n_base):
+        cont = [float(T[i]), float(pH[i]), float(F1[i]), float(F2[i]), float(F3[i])]
+        for cell in ['celltype_2', 'celltype_1', 'celltype_3']:
+            X.append(cont + [cell])
+    return X
+
+def acquisition_ei(X_cand_GP, gp, y_best, xi=0.05):
+    mu, var = gp.predict(X_cand_GP)
+    mu, sigma = mu.flatten(), np.sqrt(var.flatten())
+    sigma_safe = np.where(sigma < 1e-12, 1e-12, sigma)
+    z = (mu - y_best - xi) / sigma_safe
+    ei = (mu - y_best - xi) * scipy.stats.norm.cdf(z) + sigma_safe * scipy.stats.norm.pdf(z)
+    ei[sigma < 1e-12] = 0.0
+    return ei
+
+# =====================================================
+# BO CLASS WITH LIVE PLOTTING
+# =====================================================
+class BO:
+    def __init__(self, max_iters=10, batch_size=5, n_init=6, n_base=8000,
+                 multi_hyper=7, seed=0, time_budget=60, live_plot=True):
+        start_time = datetime.timestamp(datetime.now())
+        max_iters, batch_size, n_init = min(max_iters, 15), min(batch_size, 5), min(n_init, 6)
+        if seed is not None:
+            np.random.seed(seed)
+            random.seed(seed)
+        
+        self.max_iters, self.batch_size = max_iters, batch_size
+        self.X_lab, self.Y, self.time = [], [], []
+        self.live_plot = live_plot
+        
+        # Setup live plotting
+        if self.live_plot:
+            self.fig, self.axes = plt.subplots(4, 1, figsize=(8, 10))
+            self.fig.suptitle('Bayesian Optimization Progress (Live)', fontsize=14, fontweight='bold')
+            plt.subplots_adjust(hspace=0.35)
+            
+            self.line_time, = self.axes[0].plot([], [], 'ko', markersize=4)
+            self.axes[0].set_ylabel("Time [s]")
+            self.axes[0].set_xlabel("Evaluation #")
+            self.axes[0].grid(True, alpha=0.3)
+            self.axes[0].set_title("Time per Evaluation")
+            
+            self.line_titre, = self.axes[1].plot([], [], 'b-', linewidth=1.5)
+            self.axes[1].set_ylabel("Titre [g/L]")
+            self.axes[1].set_xlabel("Evaluation #")
+            self.axes[1].grid(True, alpha=0.3)
+            self.axes[1].set_title("Titre per Evaluation")
+            
+            self.line_cumtime, = self.axes[2].plot([], [], 'r-', linewidth=2)
+            self.axes[2].set_ylabel("Cumulative Time [s]")
+            self.axes[2].set_xlabel("Evaluation #")
+            self.axes[2].grid(True, alpha=0.3)
+            self.axes[2].set_title("Cumulative Time")
+            
+            self.line_best, = self.axes[3].plot([], [], 'g-', linewidth=2)
+            self.axes[3].set_ylabel("Best Titre So Far [g/L]")
+            self.axes[3].set_xlabel("Evaluation #")
+            self.axes[3].grid(True, alpha=0.3)
+            self.axes[3].set_title("Best Titre Convergence")
+            
+            plt.show(block=False)
+        
+        # Initial design
+        X_init = generate_initial_design_lab(n_init=n_init, seed=seed)
+        Y_init = objective_func(X_init)
+        self.X_lab, self.Y = list(X_init), Y_init.flatten().tolist()
+        
+        self.gp = GP_model(X_lab_to_GP(self.X_lab), Y_init, 'RBF', multi_hyper, True)
+        elapsed = datetime.timestamp(datetime.now()) - start_time
+        self.time += [elapsed] + [0]*(n_init-1)
+        
+        if self.live_plot:
+            self._update_plots()
+        
+        # BO Loop
+        for it in range(max_iters):
+            if time_budget and sum(self.time) > time_budget:
+                print(f"Stopping because time_budget={time_budget}s reached.")
+                break
+            
+            start_time = datetime.timestamp(datetime.now())
+            print(f"\n{'='*60}\nIteration {it+1}/{max_iters}\n{'='*60}")
+            
+            best_x = self.X_lab[np.argmax(self.Y)]
+            X_batch = self._propose_batch(n_base, batch_size, it, best_x)
+            Y_batch = objective_func(X_batch).flatten().tolist()
+            
+            self.X_lab += X_batch
+            self.Y += Y_batch
+            self.gp = GP_model(X_lab_to_GP(self.X_lab), np.array(self.Y).reshape(-1,1), 'RBF', multi_hyper, True)
+            
+            elapsed = datetime.timestamp(datetime.now()) - start_time
+            self.time += [elapsed] + [0]*(batch_size-1)
+            
+            print(f"Current Best: {max(self.Y):.2f} g/L | Batch: {[f'{y:.1f}' for y in Y_batch]}")
+            
+            if self.live_plot:
+                self._update_plots()
+        
+        if self.live_plot:
+            plt.ioff()
+            print("\n[OPTIMIZATION COMPLETE] Close plot window to continue...")
+
+    def _update_plots(self):
+        """Update live plots with current data"""
+        Y_arr = np.array(self.Y)
+        time_arr = np.array(self.time)
+        n = len(Y_arr)
+        x_vals = np.arange(n)
+        
+        cum_time = np.cumsum(time_arr)
+        best_so_far = np.maximum.accumulate(Y_arr)
+        
+        self.line_time.set_data(x_vals, time_arr)
+        self.line_titre.set_data(x_vals, Y_arr)
+        self.line_cumtime.set_data(x_vals, cum_time)
+        self.line_best.set_data(x_vals, best_so_far)
+        
+        for ax in self.axes:
+            ax.relim()
+            ax.autoscale_view()
+        
+        self.fig.canvas.draw()
+        self.fig.canvas.flush_events()
+        plt.pause(0.01)
+
+    def _propose_batch(self, n_base, batch_size, it, best_x):
+        X_cand_lab = generate_candidate_batch_lab(n_base, best_x)
+        X_cand_GP = X_lab_to_GP(X_cand_lab)
+        
+        explore_prob = max(0.0, 0.15 * (1 - it / self.max_iters))
+        if np.random.rand() < explore_prob:
+            idx = np.random.choice(len(X_cand_lab), size=batch_size, replace=False)
+            return [X_cand_lab[i] for i in idx]
+        
+        xi_start, xi_end = 0.05, 0.0005
+        xi = xi_start + (xi_end - xi_start) * (it / max(self.max_iters - 1, 1))
+        
+        y_best = max(self.Y)
+        acq = acquisition_ei(X_cand_GP, self.gp, y_best, xi=xi)
+        order = np.argsort(-acq)
+        
+        chosen = []
+        min_dist = 0.25 if it < 3 else 0.12
+        
+        for i in order:
+            if len(chosen) == 0:
+                chosen.append(i)
+            else:
+                dists = np.linalg.norm(X_cand_GP[i] - X_cand_GP[chosen], axis=1)
+                if np.min(dists) > min_dist:
+                    chosen.append(i)
+            if len(chosen) == batch_size:
+                break
+        
+        while len(chosen) < batch_size:
+            for i in order:
+                if i not in chosen:
+                    chosen.append(i)
+                    if len(chosen) == batch_size:
+                        break
+        
+        return [X_cand_lab[i] for i in chosen]
+
+# =====================================================
+# EXECUTION WITH LIVE PLOTS
+# =====================================================
+print("="*60)
+print("STARTING OPTIMIZED BAYESIAN OPTIMIZATION")
+print("Target: >300 g/L | Live plots updating...")
+print("="*60)
+
+BO_m = BO(max_iters=10, batch_size=5, n_init=6, n_base=8000,
+          multi_hyper=7, seed=0, time_budget=60, live_plot=True)
+
+# ============================================================
+# FINAL ANALYSIS PLOTS
+# ============================================================
+print("\n" + "="*60)
+print("GENERATING FINAL ANALYSIS PLOTS")
+print("="*60)
+
+Y_arr = np.array(BO_m.Y, dtype=float)
+time_arr = np.array(BO_m.time, dtype=float)
+cum_time = np.cumsum(time_arr)
+cum_Y = np.cumsum(Y_arr)
+
+# Multi-panel figure
+fig, axes = plt.subplots(4, 1, figsize=(6, 10), sharex=False)
+fig.suptitle('Final Optimization Results', fontsize=14, fontweight='bold')
+
+axes[0].scatter(range(len(time_arr)), time_arr, s=8, color='k')
+axes[0].set_ylabel("Time [s]")
+axes[0].grid(True, alpha=0.3)
+
+axes[1].plot(range(len(Y_arr)), Y_arr, color='k')
+axes[1].set_ylabel("Titre Conc. [g/L]")
+axes[1].grid(True, alpha=0.3)
+
+axes[2].plot(range(len(cum_time)), cum_time, color='k')
+axes[2].set_ylabel("Cumulative Time [s]")
+axes[2].set_xlabel("Iterations")
+axes[2].grid(True, alpha=0.3)
+
+axes[3].plot(range(len(cum_Y)), cum_Y, color='k')
+axes[3].set_ylabel("Cumulative Titre [g/L]")
+axes[3].set_xlabel("Iterations")
+axes[3].grid(True, alpha=0.3)
+
+fig.tight_layout()
+plt.show()
+
+# Cumulative titre vs cumulative time (step curve)
+plt.figure(figsize=(6, 3))
+plt.step(cum_time, cum_Y, where="post", color="red", linewidth=2)
+plt.xlabel("Cumulative Time [s]")
+plt.ylabel("Cumulative Titre Conc. [g/L]")
+plt.title("Performance Over Time")
+plt.grid(True, alpha=0.3)
+plt.tight_layout()
+plt.show()
+
+# Final summary
+print("\n" + "="*60)
+print("OPTIMIZATION SUMMARY")
+print("="*60)
+print(f"Best first reached at experiment index (0-based): {np.argmax(np.maximum.accumulate(Y_arr))}")
+print(f"That's experiment # {np.argmax(np.maximum.accumulate(Y_arr)) + 1} in total.")
+print(f"Total experiments: {len(BO_m.Y)}")
+print(f"Max titre found: {max(BO_m.Y):.4f} g/L")
+print(f"Best X: {BO_m.X_lab[np.argmax(BO_m.Y)]}")
+print(f"Total runtime: {sum(BO_m.time):.2f} s")
+print("="*60)

@@ -12,6 +12,10 @@ import sobol_seq
 import time
 from datetime import datetime
 
+CONT_MIN = np.array([30.0, 6.0, 0.0, 0.0, 0.0])
+CONT_MAX = np.array([40.0, 8.0, 50.0, 50.0, 50.0])
+CONT_RANGE = CONT_MAX - CONT_MIN
+
 # -----------------------------------------------------
 # HELPER: Simple GP model (RBF kernel)
 # -----------------------------------------------------
@@ -222,9 +226,7 @@ def generate_initial_design_lab(n_init=6, seed=None):
     and assign cell types such that all three appear at least once.
     n_init must be <= 6 to satisfy coursework.
     """
-    if seed is not None:
-        np.random.seed(seed)
-        random.seed(seed)
+    # randomness comes from global RNG state; no per-call seeding to avoid fixed seeds
 
     # Sobol over the continuous variables: n_init distinct points
     sobol_points = sobol_seq.i4_sobol_generate(5, n_init)
@@ -256,24 +258,45 @@ def generate_initial_design_lab(n_init=6, seed=None):
 # -----------------------------------------------------
 # HELPER 5: Candidate generator for BO (all 3 cell types)
 # -----------------------------------------------------
-def generate_candidate_batch_lab(n_base=5000):
+def generate_candidate_batch_lab(n_base=5000, cell_types=None, x_best_lab=None, it=None):
     """
     Generate candidates by taking n_base Sobol points in the continuous space
     and pairing each with all 3 cell types -> 3 * n_base total candidates.
     """
+    if cell_types is None:
+        cell_types = ['celltype_1', 'celltype_2', 'celltype_3']
+
     sobol_points = sobol_seq.i4_sobol_generate(5, n_base)
 
-    T  = 30 + sobol_points[:,0]*10
-    pH = 6  + sobol_points[:,1]*2
-    F1 = sobol_points[:,2]*50
-    F2 = sobol_points[:,3]*50
-    F3 = sobol_points[:,4]*50
+    T  = CONT_MIN[0] + sobol_points[:,0]*CONT_RANGE[0]
+    pH = CONT_MIN[1] + sobol_points[:,1]*CONT_RANGE[1]
+    F1 = CONT_MIN[2] + sobol_points[:,2]*CONT_RANGE[2]
+    F2 = CONT_MIN[3] + sobol_points[:,3]*CONT_RANGE[3]
+    F3 = CONT_MIN[4] + sobol_points[:,4]*CONT_RANGE[4]
 
     X = []
     for i in range(n_base):
         cont_part = [float(T[i]), float(pH[i]), float(F1[i]), float(F2[i]), float(F3[i])]
-        for cell in ['celltype_1', 'celltype_2', 'celltype_3']:
+        for cell in cell_types:
             X.append(cont_part + [cell])
+
+    if (x_best_lab is not None) and (it is not None) and (it >= 2):
+        base = np.array(x_best_lab[:5], dtype=float)
+        base_norm = (base - CONT_MIN) / np.maximum(CONT_RANGE, 1e-9)
+        radius = max(0.05, 0.35 * (0.9 ** max(0, it - 1)))
+        for _ in range(max(5, n_base // 5)):
+            noise = np.random.normal(0.0, radius, size=5)
+            cont_norm = np.clip(base_norm + noise, 0.0, 1.0)
+            cont = CONT_MIN + cont_norm * CONT_RANGE
+            X.append([
+                float(cont[0]),
+                float(cont[1]),
+                float(cont[2]),
+                float(cont[3]),
+                float(cont[4]),
+                x_best_lab[5]
+            ])
+
     return X
 
 
@@ -319,7 +342,7 @@ class BO:
                  n_init=6,
                  n_base=5000,
                  multi_hyper=3,
-                 seed=0,
+                 seed=None,
                  time_budget=60):
 
         # coursework requirement: first line in __init__
@@ -331,9 +354,7 @@ class BO:
         n_init      = min(n_init, 6)       # max 6
 
         # RNG
-        if seed is not None:
-            np.random.seed(seed)
-            random.seed(seed)
+        # Leave RNG unseeded to avoid deterministic trajectories
 
         # logging
         self.max_iters = max_iters
@@ -341,9 +362,10 @@ class BO:
         self.X_lab = []
         self.Y     = []
         self.time  = []
+        self.best_progress = []
 
         # ----- INITIAL DESIGN -----
-        X_init = generate_initial_design_lab(n_init=n_init, seed=seed)
+        X_init = generate_initial_design_lab(n_init=n_init, seed=None)
         Y_init = objective_func(X_init)
 
         self.X_lab = list(X_init)
@@ -357,6 +379,7 @@ class BO:
         elapsed = datetime.timestamp(datetime.now()) - start_time
         self.time += [elapsed] + [0]*(n_init-1)
         start_time = datetime.timestamp(datetime.now())
+        self.best_progress.append(max(self.Y))
 
         # ----- BO LOOP -----
         for it in range(max_iters):
@@ -385,35 +408,51 @@ class BO:
             elapsed = datetime.timestamp(datetime.now()) - start_time
             self.time += [elapsed] + [0]*(batch_size-1)
             start_time = datetime.timestamp(datetime.now())
+            current_best = max(self.Y)
+            self.best_progress.append(current_best)
+            print(f"After batch {it + 1}, best titre so far: {current_best:.3f}")
+            print(f"After batch {it + 1}, best titre so far: {max(self.Y):.3f}")
 
 
     def _propose_batch(self, n_base, batch_size, it):
-        X_cand_lab = generate_candidate_batch_lab(n_base)
+        allowed_cells = self._allowed_cells(it)
+        x_best_lab, y_best = self._current_best()
+
+        X_cand_lab = generate_candidate_batch_lab(
+            n_base,
+            cell_types=allowed_cells,
+            x_best_lab=x_best_lab,
+            it=it
+        )
         X_cand_GP  = X_lab_to_GP(X_cand_lab)
 
         # Exploration probability decays over iterations
         max_iters = self.max_iters
-        explore_prob = max(0.05, 0.3 * (1 - it / max_iters))
+        stagnating = self._is_stagnating(window=2, tol=0.2)
+        explore_prob = max(0.05, 0.35 * (1 - it / max_iters))
+        if stagnating:
+            explore_prob = min(0.6, explore_prob + 0.2)
 
         if np.random.rand() < explore_prob:
             idx = np.random.choice(len(X_cand_lab), size=batch_size, replace=False)
             return [X_cand_lab[i] for i in idx]
 
         # EI exploration parameter also decays
-        xi_start, xi_end = 0.1, 0.01
+        xi_start, xi_end = 0.18, 0.02
         if max_iters > 1:
             xi = xi_start + (xi_end - xi_start) * (it / (max_iters-1))
         else:
             xi = xi_end
+        if stagnating:
+            xi *= 1.5
 
-        y_best = max(self.Y)
         acq = acquisition_ei(X_cand_GP, self.gp, y_best, xi=xi)
 
         # Sort candidate indices by descending EI
         order = np.argsort(-acq)
 
         chosen = []
-        min_dist = 0.3  # minimum distance between points in GP space (tunable)
+        min_dist = 0.3 if not stagnating else 0.15
 
         for i in order:
             if len(chosen) == 0:
@@ -433,7 +472,77 @@ class BO:
                     if len(chosen) == batch_size:
                         break
 
+        # ensure at least one candidate near incumbent
+        fallback_radius = 0.03
+        cand_norms = (X_cand_GP - X_cand_GP.min(axis=0)) / (X_cand_GP.max(axis=0) - X_cand_GP.min(axis=0) + 1e-9)
+        best_norm = (np.array(x_best_lab[:5], dtype=float) - CONT_MIN) / np.maximum(CONT_RANGE, 1e-9)
+        dists_to_best = [np.linalg.norm(cand_norms[idx, :5] - best_norm) for idx in chosen]
+        if dists_to_best and np.min(dists_to_best) > fallback_radius:
+            jitter = self._local_jitter_points(x_best_lab, count=1)[0]
+            if len(chosen) == batch_size:
+                worst = int(np.argmin([acq[i] for i in chosen]))
+                chosen[worst] = len(X_cand_lab)
+            else:
+                chosen.append(len(X_cand_lab))
+            X_cand_lab.append(jitter)
+            X_cand_GP = X_lab_to_GP(X_cand_lab)
+
         return [X_cand_lab[i] for i in chosen]
+
+    def _current_best(self):
+        y_array = np.array(self.Y)
+        idx = int(np.argmax(y_array))
+        return self.X_lab[idx], float(y_array[idx])
+
+    def _cell_statistics(self):
+        stats = {}
+        for cell in ['celltype_1', 'celltype_2', 'celltype_3']:
+            vals = [y for x, y in zip(self.X_lab, self.Y) if x[5] == cell]
+            if vals:
+                stats[cell] = {'best': max(vals), 'n': len(vals)}
+            else:
+                stats[cell] = {'best': float('-inf'), 'n': 0}
+        return stats
+
+    def _allowed_cells(self, it):
+        base_cells = ['celltype_1', 'celltype_2', 'celltype_3']
+        if it < 2:
+            return base_cells
+        stats = self._cell_statistics()
+        ordered = sorted(stats.items(), key=lambda kv: kv[1]['best'], reverse=True)
+        available = [cell for cell, meta in ordered if meta['n'] > 0]
+        if len(available) <= 1:
+            return base_cells
+        best_cell, best_meta = ordered[0]
+        second_cell, second_meta = ordered[1]
+        if best_meta['n'] >= 4 and (best_meta['best'] - second_meta['best']) > 1.0:
+            return [best_cell]
+        if best_meta['n'] >= 3 and (best_meta['best'] - second_meta['best']) > 0.5:
+            return [best_cell, second_cell]
+        return available
+
+    def _is_stagnating(self, window=2, tol=0.2):
+        if len(self.best_progress) <= window:
+            return False
+        return (self.best_progress[-1] - self.best_progress[-1 - window]) < tol
+
+    def _local_jitter_points(self, x_best_lab, count=1):
+        base = np.array(x_best_lab[:5], dtype=float)
+        base_norm = (base - CONT_MIN) / np.maximum(CONT_RANGE, 1e-9)
+        jitter_points = []
+        for _ in range(count):
+            noise = np.random.normal(0.0, 0.02, size=5)
+            cont_norm = np.clip(base_norm + noise, 0.0, 1.0)
+            cont = CONT_MIN + cont_norm * CONT_RANGE
+            jitter_points.append([
+                float(cont[0]),
+                float(cont[1]),
+                float(cont[2]),
+                float(cont[3]),
+                float(cont[4]),
+                x_best_lab[5]
+            ])
+        return jitter_points
 
 
 # -----------------------------------------------------
@@ -445,7 +554,7 @@ BO_m = BO(
     n_init=6,
     n_base=5000,
     multi_hyper=3,
-    seed=0,
+    seed=None,
     time_budget=60
 )
 

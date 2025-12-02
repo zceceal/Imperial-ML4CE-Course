@@ -111,7 +111,7 @@ class GP_model:
         multi_start      = self.multi_hyper                   # multistart on hyperparameter optimization
         multi_startvec   = sobol_seq.i4_sobol_generate(nx_dim + 2,multi_start)
 
-        options  = {'disp':False,'maxiter':10000}          # solver options
+        options  = {'disp': False, 'maxiter': 500}       # solver options
         hypopt   = np.zeros((nx_dim+2, ny_dim))            # hyperparams w's + sf2+ sn2 (one for each GP i.e. output var)
         localsol = [0.]*multi_start                        # values for multistart
         localval = np.zeros((multi_start))                 # variables for multistart
