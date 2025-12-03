@@ -31,6 +31,12 @@ CONT_MIN = np.array([30.0, 6.0, 0.0, 0.0, 0.0])
 CONT_MAX = np.array([40.0, 8.0, 50.0, 50.0, 50.0])
 CONT_RANGE = CONT_MAX - CONT_MIN
 
+# Reproducible RNG (same style as the trust-region code)
+REPRODUCIBLE_SEED = None  # or set to an int for repeatable runs, e.g. 42
+rng = np.random.default_rng(REPRODUCIBLE_SEED)
+
+CELLTYPES = ['celltype_1', 'celltype_2', 'celltype_3']
+
 
 # ============================================================
 # Helper functions (inlined from gaussian_process2)
@@ -62,26 +68,32 @@ def objective_func(X_lab):
 
 
 def generate_initial_design_lab(n_init=6):
-    sobol_points = sobol_seq.i4_sobol_generate(5, n_init)
-    T_vals  = CONT_MIN[0] + sobol_points[:, 0] * CONT_RANGE[0]
-    pH_vals = CONT_MIN[1] + sobol_points[:, 1] * CONT_RANGE[1]
-    F_vals  = sobol_points[:, 2:5] * CONT_RANGE[2:5]
-
-    base_cells = ['celltype_1', 'celltype_2', 'celltype_3']
-    repeats = n_init // 3 + 1
-    cell_types = (base_cells * repeats)[:n_init]
+    """
+    Generate initial points in the same way as the global_pool in the
+    trust-region BO:
+      - uniform random in the 5 continuous variables (T, pH, F1, F2, F3)
+      - deterministic cycling over the 3 cell types
+    """
+    # Uniform in [0,1]^5
+    z = rng.random((n_init, 5))
 
     X_init = []
     for i in range(n_init):
+        # Unscale to [CONT_MIN, CONT_MAX]
+        cont = CONT_MIN + z[i] * CONT_RANGE
+        ct = CELLTYPES[i % 3]  # cycle deterministically: 1,2,3,1,2,3,...
+
         X_init.append([
-            float(T_vals[i]),
-            float(pH_vals[i]),
-            float(F_vals[i, 0]),
-            float(F_vals[i, 1]),
-            float(F_vals[i, 2]),
-            cell_types[i]
+            float(cont[0]),  # T
+            float(cont[1]),  # pH
+            float(cont[2]),  # F1
+            float(cont[3]),  # F2
+            float(cont[4]),  # F3
+            ct               # cell type
         ])
+
     return X_init
+
 
 
 # ============================================================
